@@ -9,13 +9,9 @@ from datasets import get_wiki_data
 from models import TransformerModel
 
 
-train_data, val_data, test_data = get_wiki_data()
-
-print(train_data[0])
+vocab, train_data, val_data, test_data = get_wiki_data()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-exit(0)
 
 def batchify(data, bsz):
     # Divide the dataset into bsz parts.

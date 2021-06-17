@@ -19,4 +19,4 @@ def get_wiki_data():
     train_data = data_process(iter(io.open(train_filepath, encoding='utf8')))
     val_data = data_process(iter(io.open(valid_filepath, encoding='utf8')))
     test_data = data_process(iter(io.open(test_filepath, encoding='utf8')))
-    return train_data, val_data, test_data
+    return vocab, train_data, val_data, test_data
