@@ -1,116 +1,112 @@
 import math
 import time
+from timeit import default_timer as timer
 
+import numpy as np
 import torch
 import torch.nn as nn
-from endaaman import Commander
+from torch.utils.data import DataLoader
 
-from datasets import get_wiki_data
-from models import TransformerModel
-
-
-vocab, train_data, val_data, test_data = get_wiki_data()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def batchify(data, bsz):
-    # Divide the dataset into bsz parts.
-    nbatch = data.size(0) // bsz
-    # Trim off any extra elements that wouldn't cleanly fit (remainders).
-    data = data.narrow(0, 0, nbatch * bsz)
-    # Evenly divide the data across the bsz batches.
-    data = data.view(bsz, -1).t().contiguous()
-    return data.to(device)
+from endaaman import Trainer
+from datasets import get_wiki_data, get_translate_data, get_collate_fn
+from models import Seq2SeqTransformer, create_mask
 
 
-batch_size = 10
-eval_batch_size = 5
-train_data = batchify(train_data, batch_size)
-val_data = batchify(val_data, eval_batch_size)
-test_data = batchify(test_data, eval_batch_size)
+class MyTrainer(Trainer):
+    def arg_common(self, parser):
+        parser.add_argument('-e', '--epoch', type=int, default=18)
+        parser.add_argument('-b', '--batch-size', default=2)
 
-bptt = 35
-def get_batch(source, i):
-    seq_len = min(bptt, len(source) - 1 - i)
-    data = source[i:i+seq_len]
-    target = source[i+1:i+1+seq_len].reshape(-1)
-    return data, target
+    def run_translate(self, args):
+        (en_vocab, de_vocab), train_data, val_data, test_data = get_translate_data()
+        print('data loaded')
 
+        torch.manual_seed(0)
+        SRC_VOCAB_SIZE = len(en_vocab) + 100
+        TGT_VOCAB_SIZE = len(de_vocab)
+        EMB_SIZE = 512
+        NHEAD = 8
+        FFN_HID_DIM = 512
+        NUM_ENCODER_LAYERS = 3
+        NUM_DECODER_LAYERS = 3
 
-ntokens = len(vocab.stoi) # the size of vocabulary
-emsize = 200 # embedding dimension
-nhid = 200 # the dimension of the feedforward network model in nn.TransformerEncoder
-nlayers = 2 # the number of nn.TransformerEncoderLayer in nn.TransformerEncoder
-nhead = 2 # the number of heads in the multiheadattention models
-dropout = 0.2 # the dropout value
-model = TransformerModel(ntokens, emsize, nhead, nhid, nlayers, dropout).to(device)
-
-criterion = nn.CrossEntropyLoss()
-lr = 5.0 # learning rate
-optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
-
-def train():
-    model.train() # Turn on the train mode
-    total_loss = 0.
-    start_time = time.time()
-    src_mask = model.generate_square_subsequent_mask(bptt).to(device)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, bptt)):
-        data, targets = get_batch(train_data, i)
-        optimizer.zero_grad()
-        if data.size(0) != bptt:
-            src_mask = model.generate_square_subsequent_mask(data.size(0)).to(device)
-        output = model(data, src_mask)
-        loss = criterion(output.view(-1, ntokens), targets)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-
-        total_loss += loss.item()
-        log_interval = 200
-        if batch % log_interval == 0 and batch > 0:
-            cur_loss = total_loss / log_interval
-            elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | '
-                  'lr {:02.2f} | ms/batch {:5.2f} | '
-                  'loss {:5.2f} | ppl {:8.2f}'.format(
-                    epoch, batch, len(train_data) // bptt, scheduler.get_lr()[0],
-                    elapsed * 1000 / log_interval,
-                    cur_loss, math.exp(cur_loss)))
-            total_loss = 0
-            start_time = time.time()
-
-def evaluate(eval_model, data_source):
-    eval_model.eval() # Turn on the evaluation mode
-    total_loss = 0.
-    src_mask = model.generate_square_subsequent_mask(bptt).to(device)
-    with torch.no_grad():
-        for i in range(0, data_source.size(0) - 1, bptt):
-            data, targets = get_batch(data_source, i)
-            if data.size(0) != bptt:
-                src_mask = model.generate_square_subsequent_mask(data.size(0)).to(device)
-            output = eval_model(data, src_mask)
-            output_flat = output.view(-1, ntokens)
-            total_loss += len(data) * criterion(output_flat, targets).item()
-    return total_loss / (len(data_source) - 1)
+        model = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
+                                         NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
 
 
-best_val_loss = float("inf")
-epochs = 3 # The number of epochs
-best_model = None
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
-for epoch in range(1, epochs + 1):
-    epoch_start_time = time.time()
-    train()
-    val_loss = evaluate(model, val_data)
-    print('-' * 89)
-    print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-          'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
-                                     val_loss, math.exp(val_loss)))
-    print('-' * 89)
+        model = model.to(self.device)
 
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        best_model = model
+        generate_batch_fn = get_collate_fn(en_vocab, de_vocab)
+        train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True, collate_fn=generate_batch_fn)
+        valid_loader = DataLoader(val_data, batch_size=self.args.batch_size, shuffle=True, collate_fn=generate_batch_fn)
+        test_iter = DataLoader(test_data, batch_size=self.args.batch_size, shuffle=True, collate_fn=generate_batch_fn)
 
-    scheduler.step()
+        PAD_IDX = en_vocab.stoi['<pad>']
+        loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
+
+        for epoch in range(1, self.args.epoch + 1):
+            start_time = timer()
+            train_loss = self.train_epoch(model, optimizer, train_loader)
+            end_time = timer()
+            val_loss = self.evaluate(model, valid_loader)
+            print(f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s")
+
+    def train_epoch(self, model, optimizer, loader):
+        model.train()
+        losses = 0
+        for src, tgt in loader:
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+            print(src)
+            print(tgt)
+            print(src.size())
+            print(tgt.size())
+            # tgt_input = tgt[:-1, :]
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, tgt)
+
+            print('src', src.size(), 'src mask', src_mask.size(), 'tgt', tgt.size(), 'tgt mast', tgt_mask.size())
+
+            logits = model(
+                src,
+                tgt,
+                src_mask,
+                tgt_mask,
+                src_padding_mask,
+                tgt_padding_mask,
+                src_padding_mask)
+
+            optimizer.zero_grad()
+            tgt_out = tgt[1:, :]
+            loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+            loss.backward()
+            optimizer.step()
+            losses += loss.item()
+
+        return losses / len(loader)
+
+
+    def evaluate(self, model, loader):
+        model.eval()
+        losses = 0
+
+        for src, tgt in loader:
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+            tgt_input = tgt[:-1, :]
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, tgt_input)
+            logits = model(src, tgt_input, src_mask, tgt_mask,src_padding_mask, tgt_padding_mask, src_padding_mask)
+            tgt_out = tgt[1:, :]
+            loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+            losses += loss.item()
+
+        return losses / len(loader)
+
+
+
+
+MyTrainer().run()

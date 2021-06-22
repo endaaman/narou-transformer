@@ -10,21 +10,25 @@ import torch.nn.functional as F
 
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, emb_size, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, emb_size)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, emb_size, 2).float() * (-math.log(10000.0) / emb_size))
-        pe[:, 0::2] = torch.sin(pos * div_term)
-        pe[:, 1::2] = torch.cos(pos * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
+class PositionalEncoding(nn.Module):
+    def __init__(self,
+                 emb_size: int,
+                 dropout: float,
+                 maxlen: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
+
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
+
+    def forward(self, token_embedding: Tensor):
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
 class TokenEmbedding(nn.Module):
@@ -37,35 +41,7 @@ class TokenEmbedding(nn.Module):
         return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
 
 
-class AutoEncTransformerModel(nn.Module):
-    def __init__(self, ntoken, ninp, nout, nhead, nhid, nlayers, dropout=0.5):
-        super().__init__()
-        self.model_type = 'Transformer'
-        self.pos_encoder = PositionalEncoding(ninp, dropout)
-        encoder_layers = TransformerEncoderLayer(ninp, nhead, nhid, dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
-        self.encoder = nn.Embedding(ntoken, ninp)
-        self.ninp = ninp
-        self.decoder = nn.Linear(ninp, nout)
 
-        self.init_weights()
-
-    def init_weights(self):
-        initrange = 0.1
-        self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.decoder.bias.data.zero_()
-        self.decoder.weight.data.uniform_(-initrange, initrange)
-
-    def forward(self, src, src_mask):
-        src = self.encoder(src) * math.sqrt(self.ninp)
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, src_mask)
-        output = self.decoder(output)
-        return output
-
-
-
-# Seq2Seq Network
 class Seq2SeqTransformer(nn.Module):
     def __init__(self,
                  num_encoder_layers: int,
@@ -76,7 +52,7 @@ class Seq2SeqTransformer(nn.Module):
                  tgt_vocab_size: int,
                  dim_feedforward: int = 512,
                  dropout: float = 0.1):
-        super(Seq2SeqTransformer, self).__init__()
+        super().__init__()
         self.transformer = Transformer(d_model=emb_size,
                                        nhead=nhead,
                                        num_encoder_layers=num_encoder_layers,
@@ -113,6 +89,44 @@ class Seq2SeqTransformer(nn.Module):
                           tgt_mask)
 
 
+class Disclaimer(nn.Module):
+    def __init__(self,
+                 num_encoder_layers: int,
+                 num_decoder_layers: int,
+                 emb_size: int,
+                 nhead: int,
+                 src_vocab_size: int,
+                 tgt_vocab_size: int,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.transformer = Transformer(d_model=emb_size,
+                                       nhead=nhead,
+                                       num_encoder_layers=num_encoder_layers,
+                                       num_decoder_layers=num_decoder_layers,
+                                       dim_feedforward=dim_feedforward,
+                                       dropout=dropout)
+        self.generator = nn.Linear(emb_size, tgt_vocab_size)
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
+        self.positional_encoding = PositionalEncoding(
+            emb_size, dropout=dropout)
+
+    def forward(self,
+                src: Tensor,
+                trg: Tensor,
+                src_mask: Tensor,
+                tgt_mask: Tensor,
+                src_padding_mask: Tensor,
+                tgt_padding_mask: Tensor,
+                memory_key_padding_mask: Tensor):
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
+        outs = self.transformer(src_emb, tgt_emb, src_mask, tgt_mask, None,
+                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
+        return outs
+
+
 def generate_square_subsequent_mask(sz):
     mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
     mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
@@ -123,38 +137,12 @@ def create_mask(src, tgt):
     src_seq_len = src.shape[0]
     tgt_seq_len = tgt.shape[0]
 
-    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
     src_mask = torch.zeros((src_seq_len, src_seq_len)).type(torch.bool)
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
 
     src_padding_mask = (src == PAD_IDX).transpose(0, 1)
     tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
     return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
-
-def test_autoenc():
-    # ntokens = len(vocab.stoi) # the size of vocabulary
-    ntokens = 100
-    ninp = 200 # embedding dimension
-    nout = 1
-    nhid = 200 # the dimension of the feedforward network model in nn.TransformerEncoder
-    nlayers = 2 # the number of nn.TransformerEncoderLayer in nn.TransformerEncoder
-    nhead = 2 # the number of heads in the multiheadattention models
-    dropout = 0.2 # the dropout value
-    model = AutoEncTransformerModel(ntokens, ninp, nout, nhead, nhid, nlayers, dropout)
-
-    bptt = 35
-    input_tensor = (torch.randn(35, 10) + 3).type(torch.LongTensor)
-
-    src_mask = generate_square_subsequent_mask(bptt)
-    if input_tensor.size(0) != bptt:
-        src_mask = generate_square_subsequent_mask(input_tensor.size(0))
-
-    print('in')
-    print(input_tensor.size(), src_mask.size())
-    print(input_tensor.type(), src_mask.type())
-    output_tensor = model(input_tensor, src_mask)
-    print('out')
-    print(output_tensor.size())
-    print(output_tensor.view(-1, nout).size())
 
 def test_seq2seq():
     SRC_VOCAB_SIZE = 1000
@@ -169,30 +157,72 @@ def test_seq2seq():
     model = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
                                      NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
 
-    src_tensor = torch.ones(35, 10).type(torch.LongTensor)
+    src_tensor = torch.ones(2, 10).type(torch.LongTensor)
     tgt_tensor = torch.ones(100, 10).type(torch.LongTensor)
 
     src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src_tensor, tgt_tensor)
 
+    print('in')
+    print('src', src_tensor.size(), 'src-mask', src_mask.size(), 'tgt', tgt_tensor.size(), 'tgt-mask', tgt_mask.size())
+    print(src_tensor.type(), src_mask.type())
+
+    print('> logits')
+
     logits = model(
         src_tensor,
         tgt_tensor,
-
         src_mask,
         tgt_mask,
-
         src_padding_mask,
         tgt_padding_mask,
-
         src_padding_mask)
 
+    print('out')
+    print(logits.size())
+
+    print()
+    print('> encode')
+
+    results = model.encode(src_tensor, src_mask)
+    print(results.size())
+    print('out')
+
+
+def test_gan():
+    SRC_VOCAB_SIZE = 10
+    TGT_VOCAB_SIZE = 10
+    EMB_SIZE = 512
+    NHEAD = 8
+    FFN_HID_DIM = 512
+    NUM_ENCODER_LAYERS = 3
+    NUM_DECODER_LAYERS = 3
+
+    disclaimer = Disclaimer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
+                                     NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
+
+    src_tensor = torch.ones(15, 2).type(torch.LongTensor) * 11
+    print(src_tensor)
+    tgt_tensor = torch.ones(18, 2).type(torch.LongTensor)
+    src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src_tensor, tgt_tensor)
+
     print('in')
-    print(src_tensor.size(), src_mask.size())
+    print('src', src_tensor.size(), 'src mask', src_mask.size(), 'tgt', tgt_tensor.size(), 'tgt mast', tgt_mask.size())
     print(src_tensor.type(), src_mask.type())
+
+    print('> logits')
+
+    logits = disclaimer(
+        src_tensor,
+        tgt_tensor,
+        src_mask,
+        tgt_mask,
+        src_padding_mask,
+        tgt_padding_mask,
+        src_padding_mask)
+
     print('out')
     print(logits.size())
 
 
-
 if __name__ == '__main__':
-    test_seq2seq()
+    test_gan()
