@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from endaaman import Trainer
+from endaaman import TorchCommander
 from datasets import get_wiki_data, get_translate_data, get_collate_fn
 from models import Seq2SeqTransformer, create_mask
 
 
-class MyTrainer(Trainer):
+class Trainer(TorchCommander):
     def arg_common(self, parser):
         parser.add_argument('-e', '--epoch', type=int, default=18)
         parser.add_argument('-b', '--batch-size', default=2)
@@ -109,4 +109,4 @@ class MyTrainer(Trainer):
 
 
 
-MyTrainer().run()
+Trainer().run()
