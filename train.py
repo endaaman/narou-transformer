@@ -9,7 +9,45 @@ from torch.utils.data import DataLoader
 
 from endaaman import TorchCommander
 from datasets import get_wiki_data, get_translate_data, get_collate_fn
-from models import Seq2SeqTransformer, create_mask
+
+
+class BertForSequenceClassification_pl(pl.LightningModule):
+
+    def __init__(self, model_name, num_labels, lr):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # BERTのロード
+        self.bert_sc = BertForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=num_labels
+        )
+
+    # 学習データのミニバッチ(`batch`)が与えられた時に損失を出力する関数を書く。
+    # batch_idxはミニバッチの番号であるが今回は使わない。
+    def training_step(self, batch, batch_idx):
+        output = self.bert_sc(**batch)
+        loss = output.loss
+        self.log('train_loss', loss) # 損失を'train_loss'の名前でログをとる。
+        return loss
+
+    # 検証データのミニバッチが与えられた時に、
+    # 検証データを評価する指標を計算する関数を書く。
+    def validation_step(self, batch, batch_idx):
+        output = self.bert_sc(**batch)
+        val_loss = output.loss
+        self.log('val_loss', val_loss)
+
+    def test_step(self, batch, batch_idx):
+        labels = batch.pop('labels') # バッチからラベルを取得
+        output = self.bert_sc(**batch)
+        labels_predicted = output.logits.argmax(-1)
+        num_correct = ( labels_predicted == labels ).sum().item()
+        accuracy = num_correct/labels.size(0) #精度
+        self.log('accuracy', accuracy)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 
 class Trainer(TorchCommander):
@@ -105,8 +143,6 @@ class Trainer(TorchCommander):
             losses += loss.item()
 
         return losses / len(loader)
-
-
 
 
 Trainer().run()

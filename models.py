@@ -1,228 +1,202 @@
 import math
 
+import numpy as np
 from torch import Tensor
 from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytorch_lightning as pl
 
 
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self,
-                 emb_size: int,
-                 dropout: float,
-                 maxlen: int = 5000):
+    """
+    Classic Attention-is-all-you-need positional encoding.
+    From PyTorch docs.
+    """
+
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
-        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
-        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
-        pos_embedding = torch.zeros((maxlen, emb_size))
-        pos_embedding[:, 0::2] = torch.sin(pos * den)
-        pos_embedding[:, 1::2] = torch.cos(pos * den)
-        pos_embedding = pos_embedding.unsqueeze(-2)
+        self.dropout = nn.Dropout(p=dropout)
 
-        self.dropout = nn.Dropout(dropout)
-        self.register_buffer('pos_embedding', pos_embedding)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
 
-    def forward(self, token_embedding: Tensor):
-        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
+class TransformerModel(nn.Module):
+    def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.pos_encoder = PositionalEncoding(ninp, dropout)
+        encoder_layers = TransformerEncoderLayer(ninp, nhead, nhid, dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.encoder = nn.Embedding(ntoken, ninp)
+        self.ninp = ninp
+        self.decoder = nn.Linear(ninp, ntoken)
 
-class TokenEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, emb_size):
-        super(TokenEmbedding, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.emb_size = emb_size
-
-    def forward(self, tokens: Tensor):
-        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
-
-
-
-class Seq2SeqTransformer(nn.Module):
-    def __init__(self,
-                 num_encoder_layers: int,
-                 num_decoder_layers: int,
-                 emb_size: int,
-                 nhead: int,
-                 src_vocab_size: int,
-                 tgt_vocab_size: int,
-                 dim_feedforward: int = 512,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.transformer = Transformer(d_model=emb_size,
-                                       nhead=nhead,
-                                       num_encoder_layers=num_encoder_layers,
-                                       num_decoder_layers=num_decoder_layers,
-                                       dim_feedforward=dim_feedforward,
-                                       dropout=dropout)
-        self.generator = nn.Linear(emb_size, tgt_vocab_size)
-        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
-        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
-        self.positional_encoding = PositionalEncoding(
-            emb_size, dropout=dropout)
-
-    def forward(self,
-                src: Tensor,
-                trg: Tensor,
-                src_mask: Tensor,
-                tgt_mask: Tensor,
-                src_padding_mask: Tensor,
-                tgt_padding_mask: Tensor,
-                memory_key_padding_mask: Tensor):
-        src_emb = self.positional_encoding(self.src_tok_emb(src))
-        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
-        outs = self.transformer(src_emb, tgt_emb, src_mask, tgt_mask, None,
-                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
-        return self.generator(outs)
-
-    def encode(self, src: Tensor, src_mask: Tensor):
-        return self.transformer.encoder(self.positional_encoding(
-                            self.src_tok_emb(src)), src_mask)
-
-    def decode(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor):
-        return self.transformer.decoder(self.positional_encoding(
-                          self.tgt_tok_emb(tgt)), memory,
-                          tgt_mask)
-
-
-class Disclaimer(nn.Module):
-    def __init__(self,
-                 num_encoder_layers: int,
-                 num_decoder_layers: int,
-                 emb_size: int,
-                 nhead: int,
-                 src_vocab_size: int,
-                 tgt_vocab_size: int,
-                 dim_feedforward: int = 512,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.transformer = Transformer(d_model=emb_size,
-                                       nhead=nhead,
-                                       num_encoder_layers=num_encoder_layers,
-                                       num_decoder_layers=num_decoder_layers,
-                                       dim_feedforward=dim_feedforward,
-                                       dropout=dropout)
-        self.generator = nn.Linear(emb_size, tgt_vocab_size)
-        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
-        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
-        self.positional_encoding = PositionalEncoding(
-            emb_size, dropout=dropout)
-
-    def forward(self,
-                src: Tensor,
-                trg: Tensor,
-                src_mask: Tensor,
-                tgt_mask: Tensor,
-                src_padding_mask: Tensor,
-                tgt_padding_mask: Tensor,
-                memory_key_padding_mask: Tensor):
-        src_emb = self.positional_encoding(self.src_tok_emb(src))
-        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
-        outs = self.transformer(src_emb, tgt_emb, src_mask, tgt_mask, None,
-                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
-        return outs
-
-
-def generate_square_subsequent_mask(sz):
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+def generate_square_subsequent_mask(size: int):
+    """Generate a triangular (size, size) mask. From PyTorch docs."""
+    mask = (torch.triu(torch.ones(size, size)) == 1).transpose(0, 1)
     mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
     return mask
 
 
-def create_mask(src, tgt):
-    src_seq_len = src.shape[0]
-    tgt_seq_len = tgt.shape[0]
+class Transformer(nn.Module):
+    """
+    Classic Transformer that both encodes and decodes.
 
-    src_mask = torch.zeros((src_seq_len, src_seq_len)).type(torch.bool)
-    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
+    Prediction-time inference is done greedily.
+    NOTE: start token is hard-coded to be 0, end token to be 1. If changing, update predict() accordingly.
+    """
 
-    src_padding_mask = (src == PAD_IDX).transpose(0, 1)
-    tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
-    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+    def __init__(self, num_classes: int, max_output_length: int, dim: int = 128):
+        super().__init__()
 
-def test_seq2seq():
-    SRC_VOCAB_SIZE = 1000
-    TGT_VOCAB_SIZE = 1001
-    EMB_SIZE = 512
-    NHEAD = 8
-    FFN_HID_DIM = 512
-    BATCH_SIZE = 128
-    NUM_ENCODER_LAYERS = 3
-    NUM_DECODER_LAYERS = 3
+        # Parameters
+        self.dim = dim
+        self.max_output_length = max_output_length
+        nhead = 4
+        num_layers = 4
+        dim_feedforward = dim
 
-    model = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
-                                     NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
+        # Encoder part
+        self.embedding = nn.Embedding(num_classes, dim)
+        self.pos_encoder = PositionalEncoding(d_model=self.dim)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=nn.TransformerEncoderLayer(d_model=self.dim, nhead=nhead, dim_feedforward=dim_feedforward),
+            num_layers=num_layers
+        )
 
-    src_tensor = torch.ones(2, 10).type(torch.LongTensor)
-    tgt_tensor = torch.ones(100, 10).type(torch.LongTensor)
+        # Decoder part
+        self.y_mask = generate_square_subsequent_mask(self.max_output_length)
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer=nn.TransformerDecoderLayer(d_model=self.dim, nhead=nhead, dim_feedforward=dim_feedforward),
+            num_layers=num_layers
+        )
+        self.fc = nn.Linear(self.dim, num_classes)
 
-    src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src_tensor, tgt_tensor)
+        # It is empirically important to initialize weights properly
+        self.init_weights()
 
-    print('in')
-    print('src', src_tensor.size(), 'src-mask', src_mask.size(), 'tgt', tgt_tensor.size(), 'tgt-mask', tgt_mask.size())
-    print(src_tensor.type(), src_mask.type())
+    def init_weights(self):
+        initrange = 0.1
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.fc.bias.data.zero_()
+        self.fc.weight.data.uniform_(-initrange, initrange)
 
-    print('> logits')
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Input
+            x: (B, Sx) with elements in (0, C) where C is num_classes
+            y: (B, Sy) with elements in (0, C) where C is num_classes
+        Output
+            (B, C, Sy) logits
+        """
+        encoded_x = self.encode(x)  # (Sx, B, E)
+        output = self.decode(y, encoded_x)  # (Sy, B, C)
+        return output.permute(1, 2, 0)  # (B, C, Sy)
 
-    logits = model(
-        src_tensor,
-        tgt_tensor,
-        src_mask,
-        tgt_mask,
-        src_padding_mask,
-        tgt_padding_mask,
-        src_padding_mask)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input
+            x: (B, Sx) with elements in (0, C) where C is num_classes
+        Output
+            (Sx, B, E) embedding
+        """
+        x = x.permute(1, 0)  # (Sx, B, E)
+        x = self.embedding(x) * math.sqrt(self.dim)  # (Sx, B, E)
+        x = self.pos_encoder(x)  # (Sx, B, E)
+        x = self.transformer_encoder(x)  # (Sx, B, E)
+        return x
 
-    print('out')
-    print(logits.size())
+    def decode(self, y: torch.Tensor, encoded_x: torch.Tensor) -> torch.Tensor:
+        """
+        Input
+            encoded_x: (Sx, B, E)
+            y: (B, Sy) with elements in (0, C) where C is num_classes
+        Output
+            (Sy, B, C) logits
+        """
+        y = y.permute(1, 0)  # (Sy, B)
+        y = self.embedding(y) * math.sqrt(self.dim)  # (Sy, B, E)
+        y = self.pos_encoder(y)  # (Sy, B, E)
+        Sy = y.shape[0]
+        y_mask = self.y_mask[:Sy, :Sy].type_as(encoded_x)  # (Sy, Sy)
+        output = self.transformer_decoder(y, encoded_x, y_mask)  # (Sy, B, E)
+        output = self.fc(output)  # (Sy, B, C)
+        return output
 
-    print()
-    print('> encode')
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Method to use at inference time. Predict y from x one token at a time. This method is greedy
+        decoding. Beam search can be used instead for a potential accuracy boost.
+        Input
+            x: (B, Sx) with elements in (0, C) where C is num_classes
+        Output
+            (B, C, Sy) logits
+        """
+        encoded_x = self.encode(x)
 
-    results = model.encode(src_tensor, src_mask)
-    print(results.size())
-    print('out')
+        output_tokens = (torch.ones((x.shape[0], self.max_output_length))).type_as(x).long() # (B, max_length)
+        output_tokens[:, 0] = 0  # Set start token
+        for Sy in range(1, self.max_output_length):
+            y = output_tokens[:, :Sy]  # (B, Sy)
+            output = self.decode(y, encoded_x)  # (Sy, B, C)
+            output = torch.argmax(output, dim=-1)  # (Sy, B)
+            output_tokens[:, Sy] = output[-1:]  # Set the last output token
+        return output_tokens
 
-
-def test_gan():
-    SRC_VOCAB_SIZE = 10
-    TGT_VOCAB_SIZE = 10
-    EMB_SIZE = 512
-    NHEAD = 8
-    FFN_HID_DIM = 512
-    NUM_ENCODER_LAYERS = 3
-    NUM_DECODER_LAYERS = 3
-
-    disclaimer = Disclaimer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
-                                     NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
-
-    src_tensor = torch.ones(15, 2).type(torch.LongTensor) * 11
-    print(src_tensor)
-    tgt_tensor = torch.ones(18, 2).type(torch.LongTensor)
-    src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src_tensor, tgt_tensor)
-
-    print('in')
-    print('src', src_tensor.size(), 'src mask', src_mask.size(), 'tgt', tgt_tensor.size(), 'tgt mast', tgt_mask.size())
-    print(src_tensor.type(), src_mask.type())
-
-    print('> logits')
-
-    logits = disclaimer(
-        src_tensor,
-        tgt_tensor,
-        src_mask,
-        tgt_mask,
-        src_padding_mask,
-        tgt_padding_mask,
-        src_padding_mask)
-
-    print('out')
-    print(logits.size())
 
 
 if __name__ == '__main__':
-    test_gan()
+    N = 10000
+    S = 32  # target sequence length. input sequence will be twice as long
+    C = 128  # number of "classes", including 0, the "start token", and 1, the "end token"
+    Y = (torch.rand((N * 10, S - 2)) * (C - 2)).long() + 2  # Only generate ints in (2, 99) range
+    # Make sure we only have unique rows
+    Y = torch.tensor(np.unique(Y, axis=0)[:N])
+    X = torch.repeat_interleave(Y, 2, dim=1)
+    # Add special 0 "start" and 1 "end" tokens to beginning and end
+    Y = torch.cat([torch.zeros((N, 1)), Y, torch.ones((N, 1))], dim=1).long()
+    X = torch.cat([torch.zeros((N, 1)), X, torch.ones((N, 1))], dim=1).long()
+    # Look at the data
+    print(X, X.shape)
+    print(Y, Y.shape)
+    print(Y.min(), Y.max())
+
+    BATCH_SIZE = 128
+    TRAIN_FRAC = 0.8
+
+    dataset = list(zip(X, Y))  # This fulfills the pytorch.utils.data.Dataset interface
+
+    # Split into train and val
+    num_train = int(N * TRAIN_FRAC)
+    num_val = N - num_train
+    data_train, data_val = torch.utils.data.random_split(dataset, (num_train, num_val))
+
+    dataloader_train = torch.utils.data.DataLoader(data_train, batch_size=BATCH_SIZE)
+    dataloader_val = torch.utils.data.DataLoader(data_val, batch_size=BATCH_SIZE)
+
+    # Sample batch
+    x, y = next(iter(dataloader_train))
+
+    model = Transformer(num_classes=C, max_output_length=y.shape[1])
+    logits = model(x, y[:, :-1])
+
+
+    print('x:', x.shape)
+    print('y:', y.shape)
+    print('logit:', logits.shape)
+    print(x[0:1])
+    print(model.predict(x[0:1]))

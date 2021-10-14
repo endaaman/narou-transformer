@@ -2,93 +2,92 @@ import io
 from typing import Iterable, List
 from collections import Counter
 
+from tqdm import tqdm
 import numpy as np
+import pandas as pd
+import dask.dataframe as dd
 import torch
-import torchtext
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
-from torchtext.data.utils import get_tokenizer
-from torchtext.utils import download_from_url, extract_archive
-from torchtext.vocab import Vocab, build_vocab_from_iterator
-# from torchtext.datasets import Multi30k
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def get_wiki_data():
-    url = 'https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip'
-    test_filepath, valid_filepath, train_filepath = extract_archive(download_from_url(url))
-    tokenizer = get_tokenizer('basic_english')
-    vocab = build_vocab_from_iterator(map(tokenizer, iter(io.open(train_filepath, encoding="utf8"))))
+FILENAME = 'data/Narou_All_OUTPUT_2021_06_17.csv'
 
-    def data_process(raw_text_iter):
-        data = [torch.tensor([vocab[token] for token in tokenizer(item)], dtype=torch.long) for item in raw_text_iter]
-        return torch.cat(tuple(filter(lambda t: t.numel() > 0, data)))
+genre_id_to_str = {
+    101: '異世界',
+    102: '現実世界',
+    201: 'ハイファンタジー',
+    202: 'ローファンタジー',
+    301: '純文学',
+    302: 'ヒューマンドラマ',
+    303: '歴史',
+    304: '推理',
+    305: 'ホラー',
+    306: 'アクション',
+    307: 'コメディー',
+    401: 'VRゲーム',
+    402: '宇宙',
+    403: '空想科学',
+    404: 'パニック',
+    9901: '童話',
+    9902: '詩',
+    9903: 'エッセイ',
+    9904: 'リプレイ',
+    9999: 'その他',
+    9801: 'ノンジャンル',
+}
 
-    train_data = data_process(iter(io.open(train_filepath, encoding='utf8')))
-    val_data = data_process(iter(io.open(valid_filepath, encoding='utf8')))
-    test_data = data_process(iter(io.open(test_filepath, encoding='utf8')))
-    return vocab, train_data, val_data, test_data
+class NarouDataset(Dataset):
+    def __init__(self):
+        # df = pd.read_csv(FILENAME)
+        # df = dd.read_csv(FILENAME).compute()
 
+        self.df = self.load_csv(FILENAME).dropna(subset=['title'])
+        print(self.df)
 
-def get_translate_data():
-    url_base = 'https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/'
-    train_urls = ('train.de.gz', 'train.en.gz')
-    val_urls = ('val.de.gz', 'val.en.gz')
-    test_urls = ('test_2016_flickr.de.gz', 'test_2016_flickr.en.gz')
+    def load_csv(self, filename, chunksize=10000):
+        chunks = []
+        with tqdm(total=817318) as t:
+            for chunk in pd.read_csv(FILENAME, chunksize=chunksize):
+                t.update(chunksize)
+                chunks.append(chunk)
+        return pd.concat(chunks)
 
-    train_filepaths = [extract_archive(download_from_url(url_base + url))[0] for url in train_urls]
-    val_filepaths = [extract_archive(download_from_url(url_base + url))[0] for url in val_urls]
-    test_filepaths = [extract_archive(download_from_url(url_base + url))[0] for url in test_urls]
+    def __get__(self, idx):
+        pass
 
-    en_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
-    de_tokenizer = get_tokenizer('spacy', language='de_core_news_sm')
+    def __getitem__(self, idx):
+        pass
 
-    def build_vocab(filepath, tokenizer):
-        counter = Counter()
-        with io.open(filepath, encoding="utf8") as f:
-            for string_ in f:
-                counter.update(tokenizer(string_))
-        return Vocab(counter, specials=['<unk>', '<pad>', '<bos>', '<eos>'])
+    def to_file(self, col='title', path='data/titles.txt'):
+        titles = self.df[col].values
+        with open(path, mode='w') as f:
+            f.writelines([str(t) + '\n' for t in titles])
 
-    de_vocab = build_vocab(train_filepaths[0], de_tokenizer)
-    en_vocab = build_vocab(train_filepaths[1], en_tokenizer)
+    def to_gpt2_dataset(self, tokenizer):
+        mask = np.random.rand(len(self.df)) < 0.8
+        df_train = self.df[mask]
+        df_val = self.df[~mask]
+        self.to_gpt2_dataset_by_target(tokenizer, df_train, 'train')
+        self.to_gpt2_dataset_by_target(tokenizer, df_val, 'val')
 
-    def data_process(filepaths):
-        raw_de_iter = iter(io.open(filepaths[0], encoding="utf8"))
-        raw_en_iter = iter(io.open(filepaths[1], encoding="utf8"))
-        data = []
-        for (raw_de, raw_en) in zip(raw_de_iter, raw_en_iter):
-            de_tensor_ = torch.tensor([de_vocab[token] for token in de_tokenizer(raw_de)], dtype=torch.long)
-            en_tensor_ = torch.tensor([en_vocab[token] for token in en_tokenizer(raw_en)], dtype=torch.long)
-            data.append((de_tensor_, en_tensor_))
-        return data
+    def to_gpt2_dataset_by_target(self, tokenizer, df, target='train'):
+        if target not in ['train', 'val']:
+            raise ValueError(f'Invalid target: {target}')
+        with open(f'data/gpt2_{target}.txt', 'w') as f:
+            for row in tqdm(df.itertuples(), total=df.shape[0]):
+                genre = genre_id_to_str[row.genre]
+                title = str(row.title)
+                story = row.story
+                tokens = tokenizer.tokenize(story)[:256]
+                story = "".join(tokens).replace('▁', '')
+                # text = '<s>' + genre + '[SEP]' + story + '[SEP]' + story + '</s>'
+                text = '<s>{genre}[SEP]{title}</s>'
+                f.write(text + '\n')
 
-    train_data = data_process(train_filepaths)
-    val_data = data_process(val_filepaths)
-    test_data = data_process(test_filepaths)
-    return (en_vocab, de_vocab), train_data, val_data, test_data
-
-
-def get_collate_fn(en_vocab, de_vocab):
-    PAD_IDX = de_vocab['<pad>']
-    BOS_IDX = de_vocab['<bos>']
-    EOS_IDX = de_vocab['<eos>']
-    def generate_batch(data_batch):
-        de_batch, en_batch = [], []
-        for (de_item, en_item) in data_batch:
-            de_batch.append(torch.cat([torch.tensor([BOS_IDX]), de_item, torch.tensor([EOS_IDX])], dim=0))
-            en_batch.append(torch.cat([torch.tensor([BOS_IDX]), en_item, torch.tensor([EOS_IDX])], dim=0))
-        de_batch = pad_sequence(de_batch, padding_value=PAD_IDX)
-        en_batch = pad_sequence(en_batch, padding_value=PAD_IDX)
-        return de_batch, en_batch
-    return generate_batch
-
-    # train_iter = DataLoader(train_data, batch_size=BATCH_SIZE,
-    #                         shuffle=True, collate_fn=generate_batch)
-    # valid_iter = DataLoader(val_data, batch_size=BATCH_SIZE,
-    #                         shuffle=True, collate_fn=generate_batch)
-    # test_iter = DataLoader(test_data, batch_size=BATCH_SIZE,
-    #                        shuffle=True, collate_fn=generate_batch)
 if __name__ == '__main__':
-    (en_vocab, de_vocab), train_data, val_data, test_data = get_translate_data()
-    fn = get_collate_fn(en_vocab, de_vocab)
-    train_iter = DataLoader(train_data, batch_size=8, collate_fn=fn)
+    tokenizer = AutoTokenizer.from_pretrained('rinna/japanese-gpt2-medium')
+    tokenizer.do_lower_case = True
+    ds = NarouDataset()
+    # ds.to_gpt2_dataset(tokenizer)
